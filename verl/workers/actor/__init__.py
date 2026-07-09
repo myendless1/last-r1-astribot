@@ -13,11 +13,13 @@
 # limitations under the License.
 
 from .base import BasePPOActor
-from .dp_rob import RobDataParallelPPOActor
 from .action_tokenizer import ActionTokenizer
 
 # Lazy import to avoid loading flash_attn when only RobDataParallelPPOActor is used (avoids PyTorch ABI mismatch)
 def __getattr__(name):
+    if name == "RobDataParallelPPOActor":
+        from .dp_rob import RobDataParallelPPOActor
+        return RobDataParallelPPOActor
     if name == "DataParallelPPOActor":
         from .dp_actor import DataParallelPPOActor
         return DataParallelPPOActor

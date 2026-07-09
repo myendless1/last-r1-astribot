@@ -63,17 +63,47 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
         self.temporal_patch_size = config.temporal_patch_size
         self.in_channels = config.in_channels
         self.embed_dim = config.hidden_size
+        self.flat_dim = self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size
 
         kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
         self.proj = nn.Conv3d(self.in_channels, self.embed_dim, kernel_size=kernel_size, stride=kernel_size, bias=True)
+        # Cached fp32 linear weights; synced from Conv3d for checkpoint compatibility.
+        self.register_buffer(
+            "linear_weight",
+            torch.empty(self.embed_dim, self.flat_dim, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "linear_bias",
+            torch.empty(self.embed_dim, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_load_state_dict_post_hook(
+            lambda module, _incompatible_keys: module._sync_linear_proj_weights()
+        )
+        self._sync_linear_proj_weights()
+
+    def _sync_linear_proj_weights(self) -> None:
+        weight = self.proj.weight
+        if weight.device.type == "meta":
+            return
+        with torch.no_grad():
+            src_weight = weight.reshape(self.embed_dim, self.flat_dim).float()
+            src_bias = self.proj.bias.float()
+            if self.linear_weight.device != src_weight.device:
+                self.linear_weight = src_weight
+                self.linear_bias = src_bias
+            else:
+                self.linear_weight.copy_(src_weight)
+                self.linear_bias.copy_(src_bias)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        target_dtype = self.proj.weight.dtype
-        hidden_states = hidden_states.view(
-            -1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
-        )
-        hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
-        return hidden_states
+        if self.proj.weight.device.type != "meta" and self.linear_weight.device != self.proj.weight.device:
+            self._sync_linear_proj_weights()
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.reshape(-1, self.flat_dim).float()
+        hidden_states = F.linear(hidden_states, self.linear_weight, self.linear_bias)
+        return hidden_states.to(input_dtype)
 
 
 class Qwen3VLVisionRotaryEmbedding(nn.Module):
@@ -204,6 +234,7 @@ class Qwen3VLVisionAttention(nn.Module):
 
         if self.config._attn_implementation == "flash_attention_2":
             # Flash Attention 2: Use cu_seqlens for variable length attention
+            cu_seqlens = cu_seqlens.to(query_states.device)
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
             attn_output, _ = attention_interface(
                 self,
@@ -223,8 +254,9 @@ class Qwen3VLVisionAttention(nn.Module):
         else:
             # Other implementations: Process each chunk separately
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            length_list = lengths.tolist()
             splits = [
-                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
+                torch.split(tensor, length_list, dim=2) for tensor in (query_states, key_states, value_states)
             ]
 
             attn_outputs = [
@@ -710,28 +742,44 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
         Returns:
             `torch.Tensor`: hidden_states.
         """
+        from transformers.vision_utils import apply_bilinear_pos_embed
+
         hidden_states = self.patch_embed(hidden_states)
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-        hidden_states = hidden_states + pos_embeds
+        bilinear_indices = kwargs.pop("bilinear_indices", None)
+        bilinear_weights = kwargs.pop("bilinear_weights", None)
+        if bilinear_indices is not None and bilinear_weights is not None:
+            pos_embeds = apply_bilinear_pos_embed(self.pos_embed.weight, bilinear_indices, bilinear_weights)
+        else:
+            pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        hidden_states = hidden_states + pos_embeds.to(hidden_states.dtype)
 
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        position_embeddings = kwargs.pop("position_embeddings", None)
+        if position_embeddings is None:
+            rotary_pos_emb = self.rot_pos_emb(grid_thw)
+            seq_len, _ = hidden_states.size()
+            hidden_states = hidden_states.reshape(seq_len, -1)
+            rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+            position_embeddings = (emb.cos(), emb.sin())
+        else:
+            seq_len, _ = hidden_states.size()
+            hidden_states = hidden_states.reshape(seq_len, -1)
+            cos, sin = position_embeddings
+            position_embeddings = (
+                cos.to(device=hidden_states.device, dtype=hidden_states.dtype),
+                sin.to(device=hidden_states.device, dtype=hidden_states.dtype),
+            )
 
-        seq_len, _ = hidden_states.size()
-        hidden_states = hidden_states.reshape(seq_len, -1)
-        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
-
-        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
-            dim=0,
-            # Select dtype based on the following factors:
-            #  - FA2 requires that cu_seqlens_q must have dtype int32
-            #  - torch.onnx.export requires that cu_seqlens_q must have same dtype as grid_thw
-            # See https://github.com/huggingface/transformers/pull/34852 for more information
-            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
-        )
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        cu_seqlens = kwargs.pop("cu_seqlens", None)
+        if cu_seqlens is None:
+            cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
+                dim=0,
+                dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+            )
+            cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        elif self.config._attn_implementation == "flash_attention_2":
+            cu_seqlens = cu_seqlens.to(device=hidden_states.device, dtype=torch.int32)
 
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):

@@ -345,9 +345,46 @@ class Qwen3VLVisionPatchEmbed(PatchEmbed):
         self.temporal_patch_size = config.temporal_patch_size
         self.in_channels = config.in_channels
         self.embed_dim = config.hidden_size
+        self.flat_dim = self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size
 
         kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
         self.proj = nn.Conv3d(self.in_channels, self.embed_dim, kernel_size=kernel_size, stride=kernel_size, bias=True)
+        self.register_buffer(
+            "linear_weight",
+            torch.empty(self.embed_dim, self.flat_dim, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "linear_bias",
+            torch.empty(self.embed_dim, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_load_state_dict_post_hook(
+            lambda module, _incompatible_keys: module._sync_linear_proj_weights()
+        )
+        self._sync_linear_proj_weights()
+
+    def _sync_linear_proj_weights(self) -> None:
+        weight = self.proj.weight
+        if weight.device.type == "meta":
+            return
+        with torch.no_grad():
+            src_weight = weight.reshape(self.embed_dim, self.flat_dim).float()
+            src_bias = self.proj.bias.float()
+            if self.linear_weight.device != src_weight.device:
+                self.linear_weight = src_weight
+                self.linear_bias = src_bias
+            else:
+                self.linear_weight.copy_(src_weight)
+                self.linear_bias.copy_(src_bias)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.proj.weight.device.type != "meta" and self.linear_weight.device != self.proj.weight.device:
+            self._sync_linear_proj_weights()
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.reshape(-1, self.flat_dim).float()
+        hidden_states = F.linear(hidden_states, self.linear_weight, self.linear_bias)
+        return hidden_states.to(input_dtype)
 
 
 class Qwen3VLVisionRotaryEmbedding(VisionRotaryEmbedding):
