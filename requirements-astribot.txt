@@ -1,0 +1,6 @@
+# Install with --no-deps after the repository requirements to preserve the vendored Transformers stack.
+lerobot==0.4.4
+websockets>=12
+msgpack>=1.0
+h5py>=3.10
+opencv-python-headless>=4.8

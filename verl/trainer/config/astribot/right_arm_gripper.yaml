@@ -1,0 +1,9 @@
+defaults:
+  - base
+  - _self_
+
+robot:
+  dimension_scope: right_arm_gripper
+
+trainer:
+  experiment_name: right_arm_gripper

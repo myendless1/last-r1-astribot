@@ -1185,8 +1185,13 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         image_mask = None
         video_mask = None
 
-        if pixel_values is not None:
+        precomputed_image_features = kwargs.pop("astribot_image_features", None)
+        if precomputed_image_features is not None:
+            image_embeds, deepstack_image_embeds = precomputed_image_features
+        elif pixel_values is not None:
             image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+
+        if precomputed_image_features is not None or pixel_values is not None:
             image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
@@ -1539,6 +1544,23 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         Example:
             TODO: Add example
         """
+
+        if kwargs.pop("astribot_parallel_sft", False):
+            from verl.astribot.modeling.parallel_sft import parallel_sft_forward
+
+            return parallel_sft_forward(
+                self,
+                {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "pixel_values": pixel_values,
+                    "image_grid_thw": image_grid_thw,
+                },
+                prompt_length=kwargs.pop("prompt_length"),
+                latent_length=kwargs.pop("latent_length"),
+                action_length=kwargs.pop("action_length"),
+                latent_end_id=kwargs.pop("latent_end_id"),
+            )
 
         latent_mode = kwargs.get("latent_mode")
 

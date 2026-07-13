@@ -1,0 +1,58 @@
+defaults:
+  - _self_
+
+data:
+  dataset_root: /path/to/astribot_lerobot_0_4_4
+  normalization_path: /path/to/norm_dual_arm_gripper.json
+  latent_cache_path: /path/to/dino_latents
+  action_horizon: 8
+  action_frame_stride: 1
+  future_frame_stride: 1
+  image_size_hw: [384, 320]
+  max_prompt_length: 576
+  train_batch_size: 8
+  micro_batch_size: 2
+  num_workers: 4
+  val_episode_ratio: 0.05
+
+robot:
+  dimension_scope: dual_arm_gripper
+
+model:
+  partial_pretrain: /path/to/Qwen3-VL-4B-Instruct
+  action_special_tokens: 256
+  latent_length: 8
+  latent_hidden_size: 2560
+  enable_gradient_checkpointing: true
+  attn_implementation: sdpa
+  fsdp_config:
+    wrap_policy:
+      min_num_params: 0
+    cpu_offload: false
+    offload_params: false
+
+loss:
+  latent_weight: 1.0
+  latent_end_weight: 0.1
+  action_weight: 1.0
+
+optim:
+  lr: 1.0e-5
+  betas: [0.9, 0.95]
+  weight_decay: 0.01
+  warmup_steps_ratio: 0.01
+  clip_grad: 1.0
+
+trainer:
+  default_local_dir: /tmp/astribot_last_r1
+  default_hdfs_dir: null
+  project_name: last_r1_astribot
+  experiment_name: dual_arm_gripper
+  total_epochs: 2
+  save_freq: 500
+  test_freq: 2000
+  logger: [console]
+  wandb_mode: disabled
+  seed: 42
+  profile_steps: null
+  profile_warmup_steps: 10

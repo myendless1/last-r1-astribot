@@ -107,7 +107,8 @@ def build_mask_causal(q_length, kv_length, action_length, latent_length, device=
 
 def change_mask_causal(attention_mask, action_length, latent_length, **kwargs):
     if action_length > 0:
-        attention_mask[:, :, -action_length:, -action_length:] = True
+        allowed = True if attention_mask.dtype == torch.bool else 0.0
+        attention_mask[:, :, -action_length:, -action_length:] = allowed
 
     return attention_mask
 

@@ -11,7 +11,7 @@ export NCCL_DEBUG=WARN
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_PROJECT="${WANDB_PROJECT:-last_r1}"
 export WANDB_ENABLED="${WANDB_ENABLED:-true}"
-export WANDB_API_KEY="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"
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
 
 CONDA_ENV="${CONDA_ENV:-last-r1-astribot-sft}"
 if [[ -f /media/damoxing/fileset/conda/bin/activate ]]; then

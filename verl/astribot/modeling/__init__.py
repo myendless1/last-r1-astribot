@@ -1,0 +1,1 @@
+"""Astribot model adapters."""
