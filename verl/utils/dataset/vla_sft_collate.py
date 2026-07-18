@@ -33,18 +33,19 @@ def vla_sft_collate_fn(
             )
         prompt_attn = item["attention_mask_prompt"]
         prompt_len = prompt_ids.shape[0]
-        start = max_prompt_len - prompt_len
-
-        input_ids[i, start : start + prompt_len] = prompt_ids
-        attention_mask[i, start : start + prompt_len] = prompt_attn
+        # Right padding avoids fully-masked leading query rows in SDPA. Action
+        # slots are created separately by the model after this fixed prompt area.
+        input_ids[i, :prompt_len] = prompt_ids
+        attention_mask[i, :prompt_len] = prompt_attn
 
         action_ids = item["action_token_ids"].reshape(-1)
         action_mask = item["action_loss_mask"].reshape(-1)
         action_start = max_prompt_len
         action_end = action_start + action_len
-        input_ids[i, action_start:action_end] = action_ids
-        attention_mask[i, action_start:action_end] = action_mask.to(torch.long)
 
+        # Action tokens are supervision only. Parallel LaST-R1 decoding creates
+        # zero action-slot embeddings inside the model, so GT actions must never
+        # be copied into input_ids or attention_mask.
         label_action = action_ids.clone()
         label_action[action_mask == 0] = -100
         labels[i, action_start:action_end] = label_action

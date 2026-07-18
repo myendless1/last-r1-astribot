@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from verl.utils.dataset.astribot_lerobot_sft_dataset import (
+    ASTRIBOT_IMAGE_SIZES,
     AstribotLeRobotSFTDataset,
     denormalize_vector,
     normalize_vector,
@@ -37,7 +38,9 @@ def main():
     with stats_path.open("r", encoding="utf-8") as f:
         stats = json.load(f)["astribot_centrifuge_multidrop"]
 
-    processor, model, added = prepare_qwen3vl_processor_and_model(args.model_path, local_files_only=True)
+    processor, model, added = prepare_qwen3vl_processor_and_model(
+        args.model_path, local_files_only=True, attn_implementation="sdpa"
+    )
     print(f"tokenizer/model vocab aligned, added_tokens={added}")
     action_tokenizer = ActionTokenizer(processor.tokenizer, need_to_sub=3)
 
@@ -55,6 +58,7 @@ def main():
         action_token_len=16,
         action_chunks_len=8,
         action_frame_stride=4,
+        image_sizes=ASTRIBOT_IMAGE_SIZES,
         episode_indices=[0],
     )
     sample = dataset[0]
@@ -86,9 +90,20 @@ def main():
     batch = {k: v.to(args.device) for k, v in batch.items()}
     with torch.no_grad():
         with torch.autocast(device_type=args.device, dtype=torch.bfloat16, enabled=args.device == "cuda"):
-            out = model(**{**batch, "use_cache": False})
-    print("forward loss", float(out.loss))
-    assert torch.isfinite(out.loss)
+            out = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                pixel_values=batch["pixel_values"],
+                image_grid_thw=batch["image_grid_thw"],
+                astribot_parallel_action=True,
+                prompt_length=576,
+                action_length=128,
+                action_slot_id=action_tokenizer.action_0_id,
+            )
+    local_logits = out.action_logits[..., action_tokenizer.action_0_id : action_tokenizer.action_0_id + 256]
+    print("parallel action logits", tuple(local_logits.shape), "finite", bool(torch.isfinite(local_logits).all()))
+    assert local_logits.shape == (1, 128, 256)
+    assert torch.isfinite(local_logits).all()
     print("smoke tests passed")
 
 

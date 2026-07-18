@@ -25,9 +25,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from PIL import Image
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+from transformers import AutoConfig, AutoProcessor, Qwen3VLForConditionalGeneration
 
 from verl.utils.dataset.astribot_lerobot_sft_dataset import (
+    ASTRIBOT_IMAGE_SIZES,
     AstribotLeRobotSFTDataset,
     denormalize_vector,
 )
@@ -66,11 +67,18 @@ def parse_torch_dtype(name: str) -> torch.dtype:
 
 def load_eval_model(checkpoint: str | Path, *, dtype: torch.dtype):
     checkpoint = resolve_checkpoint(checkpoint)
+    config = AutoConfig.from_pretrained(str(checkpoint), local_files_only=True)
+    decode_mode = getattr(config, "astribot_action_decode_mode", None)
+    if decode_mode != "parallel":
+        raise RuntimeError(
+            f"Checkpoint {checkpoint} was not trained with parallel action-block decoding "
+            f"(astribot_action_decode_mode={decode_mode!r}). Retrain it with the updated SFT trainer."
+        )
     processor = AutoProcessor.from_pretrained(str(checkpoint), local_files_only=True)
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         str(checkpoint),
         dtype=dtype,
-        attn_implementation="eager",
+        attn_implementation="sdpa",
         local_files_only=True,
     )
     return processor, model, checkpoint
@@ -107,101 +115,10 @@ def tokens_to_actions(
     return denorm.reshape(action_chunks_len, action_token_len).astype(np.float32)
 
 
-def predict_action_chunk_autoregressive(
-    model,
-    batch: dict[str, torch.Tensor],
-    *,
-    action_0_id: int,
-    max_prompt_length: int,
-    action_chunks_len: int,
-    action_token_len: int,
-) -> np.ndarray:
-    """Causal decode: extend prompt with one predicted action token at a time."""
-    action_len = action_chunks_len * action_token_len
-
-    input_ids = batch["input_ids"][:, :max_prompt_length].clone()
-    attention_mask = batch["attention_mask"][:, :max_prompt_length].clone()
-
-    predicted: list[int] = []
-    for _ in range(action_len):
-        forward_batch = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "pixel_values": batch["pixel_values"],
-            "image_grid_thw": batch["image_grid_thw"],
-            "labels": None,
-            "use_cache": False,
-        }
-        with torch.no_grad():
-            outputs = model(**forward_batch)
-
-        logits = outputs.logits[:, -1, action_0_id : action_0_id + 256].float()
-        logits = torch.nan_to_num(logits, nan=-1e4, posinf=1e4, neginf=-1e4)
-        token_id = int(logits.argmax(dim=-1).item()) + action_0_id
-        predicted.append(token_id)
-
-        next_token = torch.tensor([[token_id]], device=input_ids.device, dtype=input_ids.dtype)
-        input_ids = torch.cat([input_ids, next_token], dim=1)
-        next_mask = torch.ones((attention_mask.shape[0], 1), device=attention_mask.device, dtype=attention_mask.dtype)
-        attention_mask = torch.cat([attention_mask, next_mask], dim=1)
-
-    return np.array(predicted, dtype=np.int64)
-
-
-def predict_action_chunk_teacher_force(
-    model,
-    batch: dict[str, torch.Tensor],
-    *,
-    action_0_id: int,
-    max_prompt_length: int,
-    action_chunks_len: int,
-    action_token_len: int,
-    frame_index: int,
-) -> np.ndarray:
-    """Teacher-forced decode (GT action tokens in input); upper bound on training fit."""
-    action_len = action_chunks_len * action_token_len
-    action_start = max_prompt_length
-    action_end = action_start + action_len
-
-    with torch.no_grad():
-        outputs = model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            pixel_values=batch["pixel_values"],
-            image_grid_thw=batch["image_grid_thw"],
-            labels=None,
-            use_cache=False,
-        )
-
-    logits = outputs.logits[:, action_start - 1 : action_end - 1, action_0_id : action_0_id + 256]
-    if not torch.isfinite(logits).all():
-        action_tokens = batch["input_ids"][:, action_start:action_end]
-        nan_ratio = torch.isnan(logits).float().mean().item()
-        nonfinite_ratio = (~torch.isfinite(logits)).float().mean().item()
-        finite_logits = logits[torch.isfinite(logits)]
-        if finite_logits.numel() > 0:
-            finite_min = float(finite_logits.min().item())
-            finite_max = float(finite_logits.max().item())
-        else:
-            finite_min = finite_max = float("nan")
-        raise FloatingPointError(
-            "Non-finite teacher-force action logits "
-            f"(frame={frame_index}, "
-            f"action_token_range=[{int(action_tokens.min().item())}, {int(action_tokens.max().item())}], "
-            f"expected_action_token_range=[{action_0_id}, {action_0_id + 255}], "
-            f"nan_ratio={nan_ratio:.6f}, nonfinite_ratio={nonfinite_ratio:.6f}, "
-            f"finite_logit_range=[{finite_min:.6g}, {finite_max:.6g}])"
-        )
-    logits = logits.float()
-    logits = torch.nan_to_num(logits, nan=-1e4, posinf=1e4, neginf=-1e4)
-    return (logits.argmax(dim=-1) + action_0_id)[0].cpu().numpy()
-
-
 def predict_action_chunk(
     model,
     batch: dict[str, torch.Tensor],
     *,
-    mode: str,
     action_0_id: int,
     max_prompt_length: int,
     action_chunks_len: int,
@@ -210,29 +127,26 @@ def predict_action_chunk(
     action_mask: np.ndarray,
     action_q01: np.ndarray,
     action_q99: np.ndarray,
-    frame_index: int,
 ) -> np.ndarray:
-    if mode == "autoregressive":
-        token_ids = predict_action_chunk_autoregressive(
-            model,
-            batch,
-            action_0_id=action_0_id,
-            max_prompt_length=max_prompt_length,
-            action_chunks_len=action_chunks_len,
-            action_token_len=action_token_len,
+    """Generate every action token in one full-attention action-block forward."""
+    action_len = action_chunks_len * action_token_len
+    with torch.no_grad():
+        outputs = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            pixel_values=batch["pixel_values"],
+            image_grid_thw=batch["image_grid_thw"],
+            astribot_parallel_action=True,
+            prompt_length=max_prompt_length,
+            action_length=action_len,
+            action_slot_id=action_0_id,
         )
-    elif mode == "teacher_force":
-        token_ids = predict_action_chunk_teacher_force(
-            model,
-            batch,
-            action_0_id=action_0_id,
-            max_prompt_length=max_prompt_length,
-            action_chunks_len=action_chunks_len,
-            action_token_len=action_token_len,
-            frame_index=frame_index,
-        )
-    else:
-        raise ValueError(f"Unknown inference mode: {mode}")
+    logits = outputs.action_logits[..., action_0_id : action_0_id + 256].float()
+    if logits.shape[1] != action_len:
+        raise ValueError(f"Expected {action_len} parallel action logits, got {logits.shape}")
+    if not torch.isfinite(logits).all():
+        raise FloatingPointError("Non-finite parallel action logits")
+    token_ids = (logits.argmax(dim=-1) + action_0_id)[0].cpu().numpy()
 
     return tokens_to_actions(
         token_ids,
@@ -350,6 +264,15 @@ def resize_rgb(img: np.ndarray, width: int, height: int) -> np.ndarray:
     return np.asarray(Image.fromarray(img).resize((width, height), Image.BILINEAR))
 
 
+def pad_video_frame_to_even(img: np.ndarray) -> np.ndarray:
+    """yuv420p requires even frame dimensions."""
+    pad_h = img.shape[0] % 2
+    pad_w = img.shape[1] % 2
+    if not (pad_h or pad_w):
+        return img
+    return np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), constant_values=255)
+
+
 def write_eval_video(
     *,
     output_path: Path,
@@ -372,7 +295,7 @@ def write_eval_video(
     sample_plot = render_action_panel(
         gt_full, pred_full, 0, ACTION_DIM_NAMES, plot_figsize, plot_dpi
     )
-    sample = compose_video_frame(sample_obs, sample_plot)
+    sample = pad_video_frame_to_even(compose_video_frame(sample_obs, sample_plot))
     height, width = sample.shape[:2]
 
     writer = imageio.get_writer(
@@ -390,7 +313,7 @@ def write_eval_video(
             )
             if plot.shape[1] != width:
                 plot = resize_rgb(plot, width, plot.shape[0])
-            composed = compose_video_frame(obs, plot)
+            composed = pad_video_frame_to_even(compose_video_frame(obs, plot))
             writer.append_data(composed)
     finally:
         writer.close()
@@ -427,7 +350,7 @@ def save_static_overview(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Rolling astribot SFT eval video")
+    parser = argparse.ArgumentParser(description="Rolling astribot SFT evaluation")
     parser.add_argument("--checkpoint", default="/media/damoxing/ckp/last_r1_astribot_sft")
     parser.add_argument(
         "--dataset-root",
@@ -446,13 +369,18 @@ def main() -> None:
     parser.add_argument("--need-to-sub", type=int, default=3)
     parser.add_argument(
         "--inference-mode",
-        choices=["autoregressive", "teacher_force"],
-        default="autoregressive",
-        help="autoregressive matches rollout inference; teacher_force is an upper-bound fit check",
+        choices=["parallel"],
+        default="parallel",
+        help="LaST-R1 one-forward full-attention action-block decoding",
     )
     parser.add_argument("--video-fps", type=int, default=10)
     parser.add_argument("--video-frame-stride", type=int, default=2, help="Render every N frames in MP4")
     parser.add_argument("--video-width", type=int, default=1280)
+    parser.add_argument(
+        "--save-video",
+        action="store_true",
+        help="Also render an MP4. Disabled by default because rendering is slow.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
         "--eval-dtype",
@@ -494,6 +422,7 @@ def main() -> None:
         action_token_len=args.action_token_len,
         action_chunks_len=args.action_chunks_len,
         action_frame_stride=args.action_frame_stride,
+        image_sizes=ASTRIBOT_IMAGE_SIZES,
         episode_indices=[args.episode_index],
     )
 
@@ -534,7 +463,6 @@ def main() -> None:
         pred_chunk = predict_action_chunk(
             model,
             batch,
-            mode=args.inference_mode,
             action_0_id=action_0_id,
             max_prompt_length=args.max_prompt_length,
             action_chunks_len=args.action_chunks_len,
@@ -543,7 +471,6 @@ def main() -> None:
             action_mask=action_mask,
             action_q01=action_q01,
             action_q99=action_q99,
-            frame_index=frame,
         )
 
         valid = valid_mask > 0
@@ -574,24 +501,25 @@ def main() -> None:
     else:
         episode_mae = episode_mse = float("nan")
 
-    video_path = output_dir / f"rollout_{args.inference_mode}.mp4"
+    video_path = output_dir / f"rollout_{args.inference_mode}.mp4" if args.save_video else None
     overview_path = output_dir / f"overview_{args.inference_mode}.png"
 
     print(f"episode MAE={episode_mae:.5f} on {int(pred_mask.sum())} predicted frames")
-    print(f"writing video -> {video_path}")
-
-    write_eval_video(
-        output_path=video_path,
-        dataset=dataset,
-        episode_index=args.episode_index,
-        gt_full=gt_full,
-        pred_full=pred_full,
-        fps=args.video_fps,
-        frame_stride=args.video_frame_stride,
-        width=args.video_width,
-        plot_figsize=(16, 9),
-        plot_dpi=100,
-    )
+    if video_path is not None:
+        print(f"writing video -> {video_path}")
+        write_eval_video(
+            output_path=video_path,
+            dataset=dataset,
+            episode_index=args.episode_index,
+            gt_full=gt_full,
+            pred_full=pred_full,
+            fps=args.video_fps,
+            frame_stride=args.video_frame_stride,
+            width=args.video_width,
+            plot_figsize=(16, 9),
+            plot_dpi=100,
+        )
+    print(f"writing overview -> {overview_path}")
     save_static_overview(gt_full, pred_full, overview_path)
 
     summary = {
@@ -604,7 +532,7 @@ def main() -> None:
         "num_rollout_steps": len(metrics),
         "episode_mae": episode_mae,
         "episode_mse": episode_mse,
-        "video_path": str(video_path),
+        "video_path": str(video_path) if video_path is not None else None,
         "overview_path": str(overview_path),
         "steps": metrics,
     }
@@ -612,7 +540,8 @@ def main() -> None:
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    print(f"saved video: {video_path}")
+    if video_path is not None:
+        print(f"saved video: {video_path}")
     print(f"saved overview: {overview_path}")
     print(f"summary: {summary_path}")
 

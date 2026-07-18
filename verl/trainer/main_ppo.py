@@ -64,7 +64,10 @@ class RobRewardManager():
         reward_tensor = torch.zeros_like(data.batch['responses'][..., 0], dtype=torch.float32) # batch * traj_len
         verifier_reward=torch.zeros_like(data.batch['responses'][..., 0], dtype=torch.float32)
         
-        valid_response_length = torch.ceil(data.batch['finish_step'] / self.config.actor_rollout_ref.model.action_chunks_len)
+        valid_response_length = data.batch.get(
+            'trajectory_steps',
+            torch.ceil(data.batch['finish_step'] / self.config.actor_rollout_ref.model.action_chunks_len),
+        )
 
         if 'acc' in data.batch:
             # the separated rewards have been logged; now we add format correctness back for reward shaping

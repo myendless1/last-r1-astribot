@@ -1,0 +1,11 @@
+# Python 3.8 robot-side environment. ROS Noetic modules are supplied by setup.zsh.
+numpy==1.24.4
+requests>=2.31,<3
+urllib3>=1.26,<3
+websockets>=12,<14
+msgpack>=1,<2
+opencv-python>=4.8,<4.11
+h5py>=3.10,<4
+typing_extensions>=4.13,<5
+rospkg>=1.5,<2
+catkin_pkg>=1.0,<2

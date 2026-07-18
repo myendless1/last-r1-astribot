@@ -1562,6 +1562,22 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                 latent_end_id=kwargs.pop("latent_end_id"),
             )
 
+        if kwargs.pop("astribot_parallel_action", False):
+            from verl.astribot.modeling.parallel_sft import parallel_action_forward
+
+            return parallel_action_forward(
+                self,
+                {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "pixel_values": pixel_values,
+                    "image_grid_thw": image_grid_thw,
+                },
+                prompt_length=kwargs.pop("prompt_length"),
+                action_length=kwargs.pop("action_length"),
+                action_slot_id=kwargs.pop("action_slot_id"),
+            )
+
         latent_mode = kwargs.get("latent_mode")
 
         if "action_length" in kwargs and latent_mode == "ar":

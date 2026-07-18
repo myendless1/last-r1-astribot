@@ -1,0 +1,21 @@
+{
+  "host": "127.0.0.1",
+  "port": 8007,
+  "sdk_root": "/opt/astribot_sdk",
+  "dimension_scope": "right_arm_gripper",
+  "quest_state_url": "https://127.0.0.1:8443/api/state",
+  "quest_poll_rate_hz": 100.0,
+  "quest_control_rate_hz": 100.0,
+  "execute_count": 1,
+  "waypoint_duration": 0.3,
+  "camera_timeout": 0.3,
+  "max_policy_translation_step_m": 0.04,
+  "max_policy_rotation_step_deg": 15.0,
+  "max_takeover_translation_step_m": 0.01,
+  "max_takeover_rotation_step_deg": 2.5,
+  "right_min_z": 0.862,
+  "robot_command_enabled": false,
+  "observation_only": true,
+  "require_start_confirmation": true,
+  "log_dir": "outputs/astribot_real_logs"
+}

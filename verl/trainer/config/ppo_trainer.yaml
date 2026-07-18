@@ -41,6 +41,7 @@ actor_rollout_ref:
     vla: ${actor_rollout_ref.model.vla}
     action_token_len: ${actor_rollout_ref.model.action_token_len}
     action_chunks_len: ${actor_rollout_ref.model.action_chunks_len}
+    action_decode_mode: parallel
     use_proprio: ${actor_rollout_ref.rollout.use_proprio}
     strategy: fsdp  # This is for backward-compatibility
     traj_mini_batch_size: 16
@@ -100,6 +101,7 @@ actor_rollout_ref:
   rollout:
     vla: ${actor_rollout_ref.model.vla}
     action_chunks_len: ${actor_rollout_ref.model.action_chunks_len}
+    action_decode_mode: parallel
     experiment_name: None
     unnorm_key: libero_10
     twin2_task_config: demo_randomized
@@ -160,6 +162,13 @@ actor_rollout_ref:
     latent_gt_path: ""
     latent_group_mode: max
     end_do_sample: True
+    # Real Astribot gateway settings. Used only when task_suite_name=astribot_real.
+    astribot_gateway_uri: ws://127.0.0.1:8007
+    astribot_gateway_timeout: 30.0
+    astribot_prompt: ""
+    astribot_max_episode_actions: 200
+    astribot_max_resample_attempts: 20
+    astribot_confirm_reset: True
 critic:
   strategy: fsdp
   optim:

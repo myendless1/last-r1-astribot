@@ -35,6 +35,7 @@ from omegaconf import DictConfig, OmegaConf
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from verl.utils.dataset.astribot_lerobot_sft_dataset import (
+    ASTRIBOT_IMAGE_SIZES,
     AstribotLeRobotSFTDataset,
     split_episode_indices,
 )
@@ -179,25 +180,37 @@ class VLAFSDPSFTTrainer:
         logits: torch.Tensor,
         labels: torch.Tensor,
     ) -> torch.Tensor:
-        """CE only on action tokens (avoids materializing [B*seq, vocab] for full prompt)."""
-        from transformers.loss.loss_utils import ForMaskedLMLoss
-
+        """Parallel CE over action slots; action labels are never model inputs."""
         action_start, action_end = self._action_slice_bounds()
-        # Causal LM: logits at t-1 predict token t.
-        action_logits = logits[:, action_start - 1 : action_end - 1, :].contiguous()
         action_labels = labels[:, action_start:action_end].contiguous()
-        return ForMaskedLMLoss(
-            logits=action_logits,
-            labels=action_labels,
-            vocab_size=self.model.config.text_config.vocab_size,
+        if logits.shape[:2] != action_labels.shape:
+            raise ValueError(
+                f"Parallel action shape mismatch: logits={logits.shape}, labels={action_labels.shape}"
+            )
+        action_logits = logits[..., self.action_0_id : self.action_0_id + 256].float()
+        valid = action_labels != -100
+        local_labels = torch.where(valid, action_labels - self.action_0_id, action_labels)
+        if valid.any() and ((local_labels[valid] < 0) | (local_labels[valid] >= 256)).any():
+            raise ValueError("Action labels fall outside the 256-token action vocabulary")
+        return torch.nn.functional.cross_entropy(
+            action_logits.reshape(-1, 256),
+            local_labels.reshape(-1),
+            ignore_index=-100,
         )
 
     def _build_model_and_processor(self):
         freeze_vision = self.config.model.get("freeze_vision", True)
-        attn_implementation = self.config.model.get("attn_implementation")
-        if attn_implementation is None and not freeze_vision:
-            # flash_attention_2 produces NaN logits when vision tower is trainable.
-            attn_implementation = "sdpa"
+        action_decode_mode = self.config.model.get("action_decode_mode", "parallel")
+        if action_decode_mode != "parallel":
+            raise ValueError(
+                f"Unsupported action_decode_mode={action_decode_mode!r}; LaST-R1 requires 'parallel'"
+            )
+        attn_implementation = self.config.model.get("attn_implementation", "sdpa") or "sdpa"
+        if attn_implementation != "sdpa":
+            raise ValueError(
+                "Parallel action decoding requires model.attn_implementation=sdpa "
+                "so the full-attention action-block mask is applied"
+            )
 
         self.processor, self.model, added_tokens = prepare_qwen3vl_processor_and_model(
             self.local_model_path,
@@ -212,6 +225,7 @@ class VLAFSDPSFTTrainer:
 
         if hasattr(self.model, "value_head"):
             del self.model.value_head
+        self.model.config.astribot_action_decode_mode = "parallel"
 
         if freeze_vision:
             self._freeze_vision_encoder()
@@ -225,6 +239,7 @@ class VLAFSDPSFTTrainer:
 
         need_to_sub = self.config.model.get("need_to_sub", 3)
         self.action_tokenizer = ActionTokenizer(self.processor.tokenizer, need_to_sub=need_to_sub)
+        self.action_0_id = self.action_tokenizer.action_0_id
 
         mixed_precision = MixedPrecision(
             param_dtype=torch.bfloat16,
@@ -290,10 +305,7 @@ class VLAFSDPSFTTrainer:
             action_frame_stride=self.config.data.get("action_frame_stride", 4),
             use_proprio=self.config.data.use_proprio,
             center_crop=self.config.data.center_crop,
-            image_size=self.config.data.get("image_size"),
-            image_sizes=OmegaConf.to_container(
-                self.config.data.get("image_sizes"), resolve=True
-            ),
+            image_sizes=ASTRIBOT_IMAGE_SIZES,
             episode_indices=episode_indices,
             max_frames=max_frames,
             subsample_seed=(
@@ -416,10 +428,14 @@ class VLAFSDPSFTTrainer:
                 attention_mask=batch["attention_mask"],
                 pixel_values=batch["pixel_values"],
                 image_grid_thw=batch["image_grid_thw"],
-                labels=None,
-                use_cache=False,
+                astribot_parallel_action=True,
+                prompt_length=self.config.data.max_prompt_length,
+                action_length=(
+                    self.config.data.action_chunks_len * self.config.data.action_token_len
+                ),
+                action_slot_id=self.action_0_id,
             )
-        loss = self._compute_action_loss(outputs.logits, batch["labels"])
+        loss = self._compute_action_loss(outputs.action_logits, batch["labels"])
         if not torch.isfinite(loss):
             action_start, action_end = self._action_slice_bounds()
             valid = int((batch["labels"][:, action_start:action_end] != -100).sum())

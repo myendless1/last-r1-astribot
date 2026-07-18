@@ -90,7 +90,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     token_level_scores = data.batch['token_level_scores']
     batch_size = data.batch.batch_size[0]
     #attention_mask = data.batch['attention_mask']
-    finish_step = torch.ceil(data.batch['finish_step'] / action_chunks_len).long()
+    finish_step = data.batch.get('trajectory_steps', torch.ceil(data.batch['finish_step'] / action_chunks_len)).long()
     
     steps = torch.arange(traj_length, device=data.batch['responses'].device)  # (traj_len,)
     steps_expanded = steps.unsqueeze(0).expand(data.batch['responses'].size(0), -1)
@@ -148,7 +148,10 @@ def compute_advantage(data: DataProto, gamma, lam, adv_estimator, config):
         response_length = responses.size(1)
         token_level_rewards = data.batch['token_level_rewards']
 
-        finish_step = torch.ceil(data.batch['finish_step'] / config.actor_rollout_ref.model.action_chunks_len).long()
+        finish_step = data.batch.get(
+            'trajectory_steps',
+            torch.ceil(data.batch['finish_step'] / config.actor_rollout_ref.model.action_chunks_len),
+        ).long()
         steps = torch.arange(response_length, device=data.batch['responses'].device)  # (traj_len,)
         steps_expanded = steps.unsqueeze(0).expand(data.batch['responses'].size(0), -1)
         response_mask = steps_expanded < finish_step.unsqueeze(1)  # (batch_size, traj_len)
@@ -167,7 +170,10 @@ def compute_advantage(data: DataProto, gamma, lam, adv_estimator, config):
         index = data.non_tensor_batch['uid']
         responses = data.batch['responses']
         response_length = responses.size(1) *  responses.size(2)
-        finish_step = data.batch['finish_step'] * config.actor_rollout_ref.model.action_token_len 
+        finish_step = data.batch.get(
+            'trajectory_steps',
+            torch.ceil(data.batch['finish_step'] / config.actor_rollout_ref.model.action_chunks_len),
+        ) * config.actor_rollout_ref.model.action_chunks_len * config.actor_rollout_ref.model.action_token_len
         steps = torch.arange(response_length, device=data.batch['responses'].device)  # (traj_len,)
         steps_expanded = steps.unsqueeze(0).expand(data.batch['responses'].size(0), -1)
         response_mask = steps_expanded < finish_step.unsqueeze(1)  # (batch_size, traj_len)
@@ -222,7 +228,10 @@ def compute_data_metrics(batch,config):
     advantages = batch.batch['advantages']
     returns = batch.batch['returns']
     #add
-    finish_step = torch.ceil(batch.batch['finish_step'] / config.actor_rollout_ref.model.action_chunks_len).long()
+    finish_step = batch.batch.get(
+        'trajectory_steps',
+        torch.ceil(batch.batch['finish_step'] / config.actor_rollout_ref.model.action_chunks_len),
+    ).long()
     steps = torch.arange(batch.batch['responses'].size(1), device=advantages.device)  # (traj_len,)
     steps_expanded = steps.unsqueeze(0).expand(batch.batch['responses'].size(0), -1)
     response_mask = steps_expanded < finish_step.unsqueeze(1)  # (batch_size, traj_len)
@@ -304,10 +313,13 @@ class RayTrainer(object):
         import math
         from torch.utils.data import DataLoader, ConcatDataset
         # TODO: we have to make sure the batch size is divisible by the dp size
-        from verl.utils.dataset.rob_dataset import LIBERO_Dataset, Robotwin_Dataset, collate_fn
+        from verl.utils.dataset.rob_dataset import AstribotRealDataset, LIBERO_Dataset, Robotwin_Dataset, collate_fn
         from transformers import AutoProcessor
         self.processor = AutoProcessor.from_pretrained(self.config.actor_rollout_ref.model.path, local_files_only=True)
-        if "libero" in self.config.data.task_suite_name:
+        if self.config.data.task_suite_name == "astribot_real":
+            self.train_dataset = AstribotRealDataset(self.config.data.num_trials_per_task, "train")
+            self.val_dataset = AstribotRealDataset(self.config.data.num_trials_per_task, "valid")
+        elif "libero" in self.config.data.task_suite_name:
             self.train_dataset = LIBERO_Dataset(self.config.data.task_suite_name,
                                                 num_trials_per_task=self.config.data.num_trials_per_task,
                                                 train_val ="train")

@@ -33,8 +33,9 @@ model:
   action_special_tokens: 256
   need_to_sub: 3
   use_latent: false
+  action_decode_mode: parallel
   freeze_vision: true
-  attn_implementation: null   # auto sdpa when freeze_vision=false (flash_attn NaNs on trainable vision)
+  attn_implementation: sdpa   # required for LaST-R1 full-attention action-block decoding
   enable_gradient_checkpointing: true
   fsdp_config:
     wrap_policy:
@@ -53,7 +54,7 @@ trainer:
   default_local_dir: /tmp/astribot_vla_sft
   default_hdfs_dir: null
   project_name: last_r1
-  experiment_name: astribot-filter-300-oneshot
+  experiment_name: astribot-parallel-action-sft
   total_epochs: 2
   save_freq: 500
   test_freq: 2000           # run validation every N training steps (not per epoch)

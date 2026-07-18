@@ -50,6 +50,12 @@ class RobDataParallelPPOActor(BasePPOActor):
         super().__init__(config)
         self.actor_module = actor_module
         self.processor = processor
+        if self.config.vla == "qwen-oft":
+            decode_mode = self.config.get("action_decode_mode", "parallel")
+            if decode_mode != "parallel":
+                raise ValueError(
+                    f"Qwen-OFT actor update requires parallel action-block decoding, got {decode_mode!r}"
+                )
         self.action_0_id = self.processor.tokenizer.vocab.get("<action_0>")
         self.latent_end_id = self.processor.tokenizer.vocab.get("<latent_end>")
         print(f"action_0_id: {self.action_0_id}")
@@ -170,7 +176,11 @@ class RobDataParallelPPOActor(BasePPOActor):
                 log_probs = log_probs.reshape((batch_size, traj_len*self.config.action_chunks_len,self.config.action_token_len) ) #*
                 entropy = entropy.reshape((batch_size, traj_len*self.config.action_chunks_len,self.config.action_token_len) )
 
-                mask = self.generate_traj_mask(micro_batch['finish_step'], traj_len*self.config.action_chunks_len) #, self.config.action_token_len
+                valid_actions = micro_batch.get(
+                    'trajectory_steps',
+                    torch.ceil(micro_batch['finish_step'] / self.config.action_chunks_len),
+                ) * self.config.action_chunks_len
+                mask = self.generate_traj_mask(valid_actions, traj_len*self.config.action_chunks_len)
                 log_probs, entropy = self.apply_mask_with_grad_control(log_probs, entropy, mask)
                 
                 log_probs = log_probs.reshape((batch_size, traj_len*response_length))
@@ -198,6 +208,11 @@ class RobDataParallelPPOActor(BasePPOActor):
                 chosen_length=chosen_length,
             )
             assert action_logits.requires_grad
+            if action_logits.shape[1] != all_action_tokens_len:
+                raise RuntimeError(
+                    f"Parallel actor action shape mismatch: {action_logits.shape} "
+                    f"vs {all_action_tokens_len} slots"
+                )
         
         action_logits_last256 = action_logits[..., self.action_0_id:self.action_0_id+256]
         scaled_logits = action_logits_last256 / temperature
@@ -262,7 +277,7 @@ class RobDataParallelPPOActor(BasePPOActor):
         use_dynamic_bsz = data.meta_info['use_dynamic_bsz'] #trues
         self.pad_token_id = data.meta_info['pad_token_id']
         
-        select_keys = ['responses', 'input_ids', 'attention_mask', 'pixel_values',"finish_step"]
+        select_keys = ['responses', 'input_ids', 'attention_mask', 'pixel_values',"finish_step", "trajectory_steps"]
 
         batch = data.select(batch_keys=select_keys).batch
 
@@ -296,7 +311,7 @@ class RobDataParallelPPOActor(BasePPOActor):
         self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
 
-        select_keys = ['responses', 'input_ids', 'attention_mask', 'pixel_values', 'old_log_probs', 'advantages', "finish_step", "image_grid_thw", "old_values", "returns"]
+        select_keys = ['responses', 'input_ids', 'attention_mask', 'pixel_values', 'old_log_probs', 'advantages', "finish_step", "trajectory_steps", "image_grid_thw", "old_values", "returns"]
         if self.config.use_latent:
             select_keys.extend(["old_latents", "latent_mask", "chosen_length"])
             if "old_latent_end_log_prob" in data.batch.keys():
@@ -329,7 +344,9 @@ class RobDataParallelPPOActor(BasePPOActor):
                 old_values = data['old_values']
 
                 response_length = responses.size(1)
-                finish_step = torch.ceil(data['finish_step'] / self.config.action_chunks_len).long()
+                finish_step = data.get(
+                    'trajectory_steps', torch.ceil(data['finish_step'] / self.config.action_chunks_len)
+                ).long()
                 steps = torch.arange(response_length, device=data['responses'].device)  # (traj_len,)
                 steps_expanded = steps.unsqueeze(0).expand(data['responses'].size(0), -1)
                 response_mask = steps_expanded < finish_step.unsqueeze(1)  # (batch_size, traj_len)
@@ -574,7 +591,7 @@ class RobDataParallelPPOActor(BasePPOActor):
         self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size
         temperature = bacth_data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
 
-        select_keys = ['responses', 'input_ids', 'attention_mask', 'pixel_values', "finish_step"]
+        select_keys = ['responses', 'input_ids', 'attention_mask', 'pixel_values', "finish_step", "trajectory_steps"]
         if self.config.use_proprio:
             select_keys.append("proprio")
         batch = bacth_data.select(batch_keys=select_keys).batch
@@ -599,7 +616,9 @@ class RobDataParallelPPOActor(BasePPOActor):
                 data = data.cuda()  # actor device is cpu when using offload
                 responses = data['responses']
                 response_length = responses.size(1) *  responses.size(2)
-                finish_step = data['finish_step'] * self.config.action_token_len
+                finish_step = data.get(
+                    'trajectory_steps', torch.ceil(data['finish_step'] / self.config.action_chunks_len)
+                ) * self.config.action_chunks_len * self.config.action_token_len
                 steps = torch.arange(response_length, device=data['responses'].device)  # (traj_len,)
                 steps_expanded = steps.unsqueeze(0).expand(data['responses'].size(0), -1)
                 response_mask = steps_expanded < finish_step.unsqueeze(1)  # (batch_size, traj_len)

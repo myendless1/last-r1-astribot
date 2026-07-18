@@ -405,7 +405,18 @@ class RobHFRollout(BaseRollout):
         super().__init__()
         self.config = config
         self.module = module
+        if self.config.vla == "qwen-oft":
+            decode_mode = self.config.get("action_decode_mode", "parallel")
+            if decode_mode != "parallel":
+                raise ValueError(
+                    f"Qwen-OFT RL requires parallel action-block decoding, got {decode_mode!r}"
+                )
+            if self.config.attn_mode not in {"causal", "separate", "full"}:
+                raise ValueError(
+                    f"attn_mode={self.config.attn_mode!r} does not provide a full-attention action block"
+                )
         self.max_steps = {
+            "astribot_real": int(getattr(self.config, "astribot_max_episode_actions", 200)),
             "libero_spatial": self.config.libero_spatial_max_steps,
             "libero_object": self.config.libero_object_max_steps,
             "libero_goal": self.config.libero_goal_max_steps,
@@ -454,13 +465,50 @@ class RobHFRollout(BaseRollout):
         with open(statistics_path, 'r') as f:
             self.stats_data = json.load(f)
 
-        self.dataset_name = next(iter(self.stats_data))
-        self.action_mask = np.array(self.stats_data[self.dataset_name]['action']['mask'])
-        self.action_min = np.array(self.stats_data[self.dataset_name]['action']['q01'])
-        self.action_max = np.array(self.stats_data[self.dataset_name]['action']['q99'])
-        self.state_mask = np.array(self.stats_data[self.dataset_name]['state']['mask'])
-        self.state_min = np.array(self.stats_data[self.dataset_name]['state']['q01'])
-        self.state_max = np.array(self.stats_data[self.dataset_name]['state']['q99'])
+        if self.config.task_suite_name == "astribot_real":
+            from verl.astribot.data.embodiment import ACTION_KEY, STATE_KEY
+            from verl.astribot.protocol import load_protocol
+            self.astribot_protocol = load_protocol(Path(config.pretrained_checkpoint) / "astribot_protocol.json")
+            if self.astribot_protocol.dimension_scope != "right_arm_gripper":
+                raise ValueError("astribot_real currently requires right_arm_gripper")
+            expected = {
+                "action_token_len": self.astribot_protocol.action_dim,
+                "action_chunks_len": self.astribot_protocol.action_horizon,
+                "latent_length": self.astribot_protocol.latent_length,
+                "max_prompt_length": self.astribot_protocol.max_prompt_length,
+            }
+            mismatches = [f"{key}={getattr(config, key)} (checkpoint={value})"
+                          for key, value in expected.items() if int(getattr(config, key)) != int(value)]
+            if mismatches:
+                raise ValueError("Astribot RL/checkpoint protocol mismatch: " + "; ".join(mismatches))
+            norm_stats = self.stats_data.get("norm_stats", self.stats_data)
+            action_stats, state_stats = norm_stats[ACTION_KEY], norm_stats[STATE_KEY]
+            self.action_mask = np.ones(self.astribot_protocol.action_dim, dtype=bool)
+            self.action_min, self.action_max = np.asarray(action_stats["q01"]), np.asarray(action_stats["q99"])
+            self.state_mask = np.ones(self.astribot_protocol.state_dim, dtype=bool)
+            self.state_min, self.state_max = np.asarray(state_stats["q01"]), np.asarray(state_stats["q99"])
+            metadata = self.stats_data.get("metadata", {})
+            if metadata.get("dimension_scope") != self.astribot_protocol.dimension_scope:
+                raise ValueError("Astribot normalization scope does not match checkpoint protocol")
+            for key, expected_value in {
+                "action_horizon": self.astribot_protocol.action_horizon,
+                "action_frame_stride": self.astribot_protocol.action_frame_stride,
+            }.items():
+                if metadata.get(key) != expected_value:
+                    raise ValueError(
+                        f"Astribot normalization {key}={metadata.get(key)!r} does not match "
+                        f"checkpoint value {expected_value!r}"
+                    )
+            if self.action_min.shape != (self.astribot_protocol.action_dim,) or self.state_min.shape != (self.astribot_protocol.state_dim,):
+                raise ValueError("Astribot normalization dimensions do not match checkpoint protocol")
+        else:
+            self.dataset_name = next(iter(self.stats_data))
+            self.action_mask = np.array(self.stats_data[self.dataset_name]['action']['mask'])
+            self.action_min = np.array(self.stats_data[self.dataset_name]['action']['q01'])
+            self.action_max = np.array(self.stats_data[self.dataset_name]['action']['q99'])
+            self.state_mask = np.array(self.stats_data[self.dataset_name]['state']['mask'])
+            self.state_min = np.array(self.stats_data[self.dataset_name]['state']['q01'])
+            self.state_max = np.array(self.stats_data[self.dataset_name]['state']['q99'])
         
         self.vla_preprocess()
         
@@ -631,10 +679,99 @@ class RobHFRollout(BaseRollout):
         
     def _generate_minibatch(self, prompts):
         """Generate minibatch - routes to appropriate implementation based on task suite"""
+        if self.config.task_suite_name == "astribot_real":
+            return self._generate_minibatch_astribot_real(prompts)
         if "robotwin" in self.config.task_suite_name:
             return self._generate_minibatch_robotwin(prompts)
         else:
             return self._generate_minibatch_libero(prompts)
+
+    @staticmethod
+    def _astribot_step_data(vla_output, step):
+        return {
+            "responses": vla_output["responses"], "input_ids": vla_output["input_ids"],
+            "attention_mask": vla_output["attention_mask"], "pixel_values": vla_output["pixel_values"],
+            "action": vla_output["action"], "old_log_probs": vla_output["old_log_probs"],
+            "image_grid_thw": vla_output["image_grid_thw"], "step": step,
+            "old_values": vla_output["old_values"], "old_latents": vla_output.get("old_latents"),
+            "old_latent_end_log_prob": vla_output.get("old_latent_end_log_prob"),
+            "latent_mask": vla_output.get("latent_mask"), "chosen_length": vla_output.get("chosen_length"),
+        }
+
+    def _astribot_input(self, observation):
+        from verl.astribot.data.embodiment import select_astribot_dims
+        from verl.astribot.data.image_composition import preprocess_t_layout
+        layout = preprocess_t_layout(
+            observation["images"],
+            (self.astribot_protocol.image_height, self.astribot_protocol.image_width),
+            color_order=observation.get("image_color_order", "bgr"),
+        )
+        return {
+            "full_image": (layout.permute(1, 2, 0).numpy() * 255).astype(np.uint8),
+            "state": select_astribot_dims(np.asarray(observation["state"], np.float32),
+                                          self.astribot_protocol.dimension_scope),
+        }
+
+    def _generate_minibatch_astribot_real(self, prompts):
+        """Collect one valid, strictly on-policy trajectory from the single robot."""
+        if prompts.batch.batch_size[0] != 1:
+            raise ValueError("astribot_real rollout micro-batch size must be exactly 1")
+        from verl.astribot.deploy.gateway_client import AstribotGatewayClient
+        uri = str(getattr(self.config, "astribot_gateway_uri", "ws://127.0.0.1:8007"))
+        max_attempts = int(getattr(self.config, "astribot_max_resample_attempts", 20))
+        prompt = str(getattr(self.config, "astribot_prompt", ""))
+        if not prompt:
+            raise ValueError("astribot_prompt must be configured")
+        client = AstribotGatewayClient(uri, timeout=float(getattr(self.config, "astribot_gateway_timeout", 30.0)))
+        try:
+            client.assert_compatible(self.astribot_protocol)
+            self.module.eval()
+            for attempt in range(1, max_attempts + 1):
+                initial = client.reset(confirm=bool(getattr(self.config, "astribot_confirm_reset", True)))
+                if initial.get("invalid_episode") or initial.get("observation") is None:
+                    raise RuntimeError(initial.get("error") or "Astribot reset returned no observation")
+                current_input = self._astribot_input(initial["observation"])
+                history, finish_step, complete, invalid = [], 0, False, False
+                max_actions = self.max_steps["astribot_real"]
+                while finish_step < max_actions:
+                    model_input = self.process_input([current_input], [prompt])
+                    model_input.update(prompts.meta_info)
+                    output = self._generate_one_step(model_input)
+                    history.append(self._astribot_step_data(output, finish_step))
+                    result = client.step(output["action"][0])
+                    executed_count = int(result.get("executed_count", 0))
+                    finish_step += executed_count
+                    if executed_count == 0:
+                        # An A/B edge may arrive after observation but before
+                        # command dispatch. Do not train on that unexecuted draw.
+                        history.pop()
+                    if result.get("invalid_episode"):
+                        invalid = True
+                        print(f"[astribot_real] discarded attempt {attempt}: "
+                              f"{result.get('error') or 'human intervention'}", flush=True)
+                        client.hold()
+                        break
+                    if result.get("observation") is not None:
+                        current_input = self._astribot_input(result["observation"])
+                    if result.get("terminated"):
+                        complete = bool(result.get("success"))
+                        break
+                if invalid:
+                    continue
+                if not history:
+                    raise RuntimeError("Astribot episode ended before any model action was executed")
+                if self.config.bootstrap != "none":
+                    model_input = self.process_input([current_input], [prompt])
+                    model_input.update(prompts.meta_info)
+                    history.append({"old_values": self._generate_one_step(model_input)["old_values"]})
+                record = [{"active": False, "complete": complete, "finish_step": finish_step,
+                           "trajectory_steps": len(history) - (1 if self.config.bootstrap != "none" else 0),
+                           "task_file_name": f"astribot_real_{int(time.time())}"}]
+                return self._prepare_output_batch(history, record, 1)
+            raise RuntimeError(f"No valid Astribot episode after {max_attempts} attempts")
+        finally:
+            client.close()
+            self.module.train()
     
     def _generate_minibatch_robotwin(self, prompts):
         """Generate minibatch for Robotwin using threading"""
@@ -1001,6 +1138,10 @@ class RobHFRollout(BaseRollout):
         
         batch["complete"] = torch.tensor([bool(k["complete"]) for k in task_records], dtype=torch.bool, device=batch['responses'].device)
         batch["finish_step"] = torch.tensor([k["finish_step"] for k in task_records], dtype=torch.int64, device=batch['responses'].device)
+        batch["trajectory_steps"] = torch.tensor([
+            k.get("trajectory_steps", math.ceil(k["finish_step"] / self.config.action_chunks_len))
+            for k in task_records
+        ], dtype=torch.int64, device=batch['responses'].device)
         
         output_batch = TensorDict(batch, batch_size=batch_size)
         return DataProto(batch=output_batch)
@@ -1222,6 +1363,10 @@ class RobHFRollout(BaseRollout):
 
 
                 action_logits = self.module.lm_head(hidden_states[:, -action_token_num:, :])
+                if action_logits.shape[1] != action_token_num:
+                    raise RuntimeError(
+                        f"Parallel RL action shape mismatch: {action_logits.shape} vs {action_token_num} slots"
+                    )
                 action_logits_last256 = action_logits[..., self.action_0_id:self.action_0_id + 256]
                 if not torch.isfinite(action_logits_last256).all():
                     min_val = torch.finfo(action_logits_last256.dtype).min

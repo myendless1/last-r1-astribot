@@ -111,6 +111,22 @@ class LIBERO_Dataset(Dataset):
     def __getitem__(self, item):
         return self.dataframe[item]
 
+
+class AstribotRealDataset(Dataset):
+    """Synthetic episode slots; observations are acquired live by the rollout."""
+    def __init__(self, num_trials_per_task=1, train_val="train"):
+        count = max(1, int(num_trials_per_task))
+        self.dataframe = [{
+            "task_suite_name": "astribot_real",
+            "task_id": torch.tensor(-1, dtype=torch.int64).unsqueeze(0),
+            "trial_id": torch.tensor(index, dtype=torch.int64).unsqueeze(0),
+            "trial_seed": torch.tensor(index, dtype=torch.int64).unsqueeze(0),
+            "data_source": f"astribot_real_{train_val}",
+        } for index in range(count)]
+
+    def __len__(self): return len(self.dataframe)
+    def __getitem__(self, item): return self.dataframe[item]
+
 class Robotwin_Dataset(Dataset):
     def __init__(self, task_name, num_trials_per_task=50,train_val ="train"):
         if "robotwin2" in task_name:
@@ -257,5 +273,3 @@ class BufferedDataLoader:
 
     def buffer_size(self):
         return len(self.buffer)
-
-        

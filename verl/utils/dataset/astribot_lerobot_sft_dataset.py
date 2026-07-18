@@ -27,6 +27,13 @@ from torchvision.transforms import functional as TVF
 from verl.workers.actor.action_tokenizer import ActionTokenizer
 
 
+ASTRIBOT_IMAGE_SIZES: dict[str, tuple[int, int]] = {
+    "observation.images.cam_main": (320, 256),
+    "observation.images.cam_left_wrist": (160, 128),
+    "observation.images.cam_right_wrist": (160, 128),
+}
+
+
 def center_crop_image(img: Image.Image, crop_scale: float = 0.9) -> Image.Image:
     width, height = img.size
     crop_h = int(height * crop_scale)
@@ -120,7 +127,7 @@ def parse_image_sizes(
 
 
 class AstribotLeRobotSFTDataset(Dataset):
-    VIDEO_ROOT_NAME = "videos_256x320_128x160"
+    VIDEO_ROOT_NAME = "videos_480x720_240x360"
 
     def __init__(
         self,

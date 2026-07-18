@@ -62,15 +62,7 @@ def _benchmark_batch(
         for micro_batch in micro_batches:
             _cuda_sync()
             t0 = time.perf_counter()
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                trainer.fsdp_model(
-                    input_ids=micro_batch["input_ids"],
-                    attention_mask=micro_batch["attention_mask"],
-                    pixel_values=micro_batch["pixel_values"],
-                    image_grid_thw=micro_batch["image_grid_thw"],
-                    labels=micro_batch["labels"],
-                    use_cache=False,
-                )
+            trainer._compute_loss(micro_batch)
             _cuda_sync()
             forward_total += time.perf_counter() - t0
         vision_total = forward_timer.times.get("fwd_vision", 0.0)

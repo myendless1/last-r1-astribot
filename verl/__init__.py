@@ -19,9 +19,17 @@ version_folder = os.path.dirname(os.path.join(os.path.abspath(__file__)))
 with open(os.path.join(version_folder, 'version/version')) as f:
     __version__ = f.read().strip()
 
-from .protocol import DataProto
-
 from .utils.logging_utils import set_basic_config
 import logging
 
 set_basic_config(level=logging.WARNING)
+
+
+def __getattr__(name):
+    # Deployment-only Astribot processes must be able to import
+    # ``verl.astribot.deploy`` without importing torch/tensordict. Training
+    # callers that request DataProto retain the original public API.
+    if name == 'DataProto':
+        from .protocol import DataProto
+        return DataProto
+    raise AttributeError(name)

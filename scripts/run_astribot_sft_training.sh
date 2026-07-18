@@ -22,8 +22,8 @@ fi
 MODEL_PATH="${MODEL_PATH:-/media/damoxing/ckp/qwen_ft/Qwen3-VL-2B-Instruct}"
 CHECKPOINT="${CHECKPOINT:-${CKPT_DIR:-}}"
 FREEZE_VISION="${FREEZE_VISION:-true}"
-DATASET_ROOT="${DATASET_ROOT:-/media/damoxing/datasets/vae4d/lerobot-vae4d-org/astribot/centrifuge_multidrop-f2}"
-OUTPUT_DIR="${OUTPUT_DIR:-/media/damoxing/ckp/last_r1_astribot_sft}"
+DATASET_ROOT="${DATASET_ROOT:-/media/damoxing/datasets/vae4d/lerobot-vae4d-org/astribot/centrifuge_multidrop-f3}"
+OUTPUT_DIR="${OUTPUT_DIR:-/media/damoxing/ckp/last_r1_astribot_parallel_sft}"
 WANDB_DIR="${WANDB_DIR:-${OUTPUT_DIR}/wandb}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 # Platform env: WORLD_SIZE = number of nodes, RANK = node rank (0-indexed).

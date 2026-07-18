@@ -57,6 +57,43 @@ python scripts/astribot/run_robot_client.py --prompt "task instruction" \
 
 Only a short prefix of each predicted chunk is executed before observing again. Workspace, finite-value, first-step, and intra-chunk translation checks run before commands are sent.
 
+## Real-robot RL and Quest takeover
+
+Real-robot RL uses a separate Python 3.8 ROS/Astribot gateway. The gateway is
+the only SDK command owner; the training process connects to it over WebSocket.
+Start in observation-only mode and do not enable motion until images, state,
+coordinates, workspace bounds, collision protection, and emergency stop have
+been checked in an empty workspace.
+
+```bash
+# Robot shell (Python 3.8 / ROS Noetic)
+pip install -r requirements-astribot-robot.txt
+source /opt/ros/noetic/setup.zsh
+source /opt/astribot_sdk/env.sh
+python scripts/astribot/run_robot_gateway.py \
+  --config configs/astribot_real_gateway.json --observation-only
+
+# After editing the gateway config to set observation_only=false and
+# robot_command_enabled=true, start the RL process in its training environment.
+export ASTRIBOT_RL_CHECKPOINT=/path/to/checkpoint
+export ASTRIBOT_NORM=/path/to/right_arm_gripper_norm.json
+export ASTRIBOT_PROMPT='exact training task prompt'
+bash scripts/astribot/run_real_rl.sh
+```
+
+The right Quest middle trigger preempts policy motion and streams right-arm
+teleoperation commands. Right A marks success and right B marks failure. A
+middle-trigger intervention invalidates the entire episode; human actions are
+logged for audit but are never substituted for model tokens or included in PPO.
+The model still predicts an eight-step chunk, while the gateway executes one
+waypoint and re-observes. `finish_step` records actually executed waypoints and
+`trajectory_steps` records model decisions for RL masking.
+
+The optional Quest bridge can be started with
+`QUEST_SERVER_ROOT=/path/to/quest/server scripts/astribot/quest_webxr.sh`.
+This script checks ADB and applies `adb reverse`; it never installs udev rules
+or performs privileged system changes.
+
 ## Legacy path
 
 Root-level `*astribot_sft*` scripts and the v2.1 dataset modules describe the previous one-shot adaptation and are deprecated. The new trainer currently reuses its generic FSDP training loop, so those Python base modules remain in place; new experiments should use only `scripts/astribot/` and `verl/astribot/`.
